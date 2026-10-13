@@ -17,9 +17,10 @@ Default shape:
 
 ```json
 {
-  "rows": [["5h", "today", "history"], ["7d", "session", "total"]],
-  "columns": null,
-  "colors": {},
-  "pricing": {}
+  "rows": [["ctx", "id"], ["5h", "session"], ["7d", "lines"], ["scoped"]],
+  "activity": true,
+  "columns": null
 }
 ```
+
+Layout items: `ctx` `5h` `7d` `scoped` `id` `session` `lines` `spend` `today` `week` `month` `total` `history`. Put `scoped` and `spend` on a row of their own.

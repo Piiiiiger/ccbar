@@ -70,11 +70,18 @@ python -m ccbar doctor
 ## 你看到什么
 
 ```
-第1行:  5h 配额条 + 倒计时 · 今日 token + 费用 › 项目 token ♻缓存/命中率 费用 · 本周费用 › 项目 token 费用 │ 本月 token 费用 › 项目费用
-第2行:  7d 配额条 + 倒计时 · 会话费用 + $/h + →预测 + 时长 + ctx% + 代码行 · 项目总成本 › 项目 token ♻缓存 费用 + 路径
+Context ━━━─────── 34%  month $3.1k · all time $3.5k   Opus 5.5 · medium effort · ccbar ⎇ main*
+5-hour  ━━──────── 21%  $43.3  resets in 2h 58m        Session $1.23 · 15 min
+Weekly  ━━━─────── 32%  $384   resets in 5d 4h         Lines +2963 −9
+Fable   ━━━━────── 41%  $12.0  resets in 5d 4h
+◐ Bash  npm test    ◐ Explore agent  find callers · 2 min    ▸ Render activity (1 of 2 done)
 ```
 
-终端太窄？ccbar 会先切到紧凑 2x2 布局，再在不得已时裁掉尾部列；列内内容永不截断。
+每个限额后面紧跟着它所在窗口内的花费：5-hour 行是当前 5 小时窗口开始以来的花费，Weekly 行是每周限额上次重置以来的花费。Context 行放没有窗口的花费：本月和累计。右列是你在哪里（模型及其 effort 等级、项目、git 分支）、本会话的花费和时长，以及本会话新增和删除的代码行数。会话关闭 thinking 时，effort 等级后会显示 "thinking off"。
+
+只针对某个模型的周限额（Fable）在当前窗口内用过该模型后，会有自己的进度条和花费；在此之前这一行不显示。活动行只在有东西运行时出现：正在执行的工具、子代理或后台 workflow，以及进行中的 todo。
+
+终端太窄？ccbar 先缩短进度条和标签，再去掉右列；终端非常窄时，本月和累计花费会移到单独一行。单元格内容永不截断，只有活动行会按终端宽度裁剪。
 
 ## 极致轻量
 
@@ -93,26 +100,29 @@ ccbar 现在是基于 Node.js/TypeScript 的原生 Claude Code 插件。不再�
 
 - **按模型定价** — 逐条读取模型 ID。Opus、Sonnet、Haiku 各自正确计价。
 - **流式去重** — 每次 API 调用写入 2–7 条 JSONL。ccbar 按 `message.id` 去重，每条消息只算一次。
-- **缓存区分** — 缓存读取只有新输入 10% 的价格。ccbar 分别追踪，按项目显示 ♻命中率。
+- **缓存区分** — 缓存写入和读取按各模型自己的价格计算（Opus 5.5 的缓存读取为新输入的 5%，Fable 5.1 为 2.5%，其余多为 10%），并包括 Haiku 5.5 的长提示价格和 fast mode。
 - **跨会话累计** — 会话费用重启归零，你的账单不会。ccbar 扫描全部 JSONL——日、周、月、按项目。
 
-## 全方位监控
+## 每个数字的含义
 
-| 指标 | 它告诉你什么 |
-|------|-------------|
-| **5h / 7d 配额条** | 绿→黄→红渐变。在撞限额之前就知道要撞了。 |
-| **燃烧率** `$8.50/h` | 这个会话花钱的速度。 |
-| **预测** `→$18` | 按当前速度，到配额重置时会花多少。 |
-| **项目细分** `› proj ♻56M/97% $124` | 哪个项目在吃预算。缓存命中率附赠。 |
-| **代码行变化** `+250/-40` | 本会话的代码产出——花的钱值不值？ |
-| **Context %** | 上下文窗口用了多满。帮你决定何时 compact。 |
-| **今日 / 本周 / 本月** | 滚动累计，随时知道账单到哪了。 |
+| 行 | 它告诉你什么 |
+|----|-------------|
+| **Context** | 上下文窗口用了多满，然后是本自然月和累计的花费。 |
+| **5-hour** | 5 小时限额用了多少、这个窗口开始以来的花费、何时重置。 |
+| **Weekly** | 每周限额的同样信息：用量、上次重置以来的花费（与进度条对应）、重置时间。 |
+| **Fable** | Fable 自己的周限额以及其中的 Fable 花费；在窗口内用过 Fable 后显示（服务器报告了用量，或本机 transcript 中有窗口开始以来的 Fable 花费）。 |
+| **Session** | 本会话到目前为止的花费和时长。 |
+| **Lines** | 本会话新增和删除的代码行数。 |
+
+没有限额数据时（API key），5 小时花费为最近 5 小时，每周花费为从周一开始的自然周。今天的花费（含本项目份额）可通过 `today` 项加回来（见配置）。
 
 ## API 和订阅——全都追踪
 
 **API 用户** — ccbar 从逐模型 token 定价精确计算费用。你能看到每会话、每项目、每天的美元花费。
 
-**Pro / Max 订阅用户** — ccbar 通过 Anthropic OAuth API 读取你的配额。5 小时和 7 天进度条精确显示剩余额度，附带重置倒计时。
+**Pro / Max 订阅用户** — 5 小时和每周进度条显示的就是 `/usage` 和 claude.ai 显示的数字：Anthropic 的用量接口，最多每分钟刷新一次。当这个读数超过 2 分钟（例如接口持续失败）时，ccbar 改用 Claude Code 每次响应后传给状态栏的读数；两者是同一个计量、取整方式不同，可能相差 1 个百分点。已过重置时间的窗口显示 "reset, updating"，而不是旧的百分比；超过 3 分钟的读数会注明是多久以前的。`ccbar doctor` 会列出两个数据源及其时效。
+
+**关于美元数字** — 它们是按 Anthropic API 标价对本机记录的用量所做的估算。订阅用户看到的是这些用量若走 API 需要多少钱，而不是你实际支付的金额，也不包括其他设备上的用量。
 
 不管哪种，一条状态栏讲完整个故事。
 
@@ -128,18 +138,19 @@ ccbar 现在是基于 Node.js/TypeScript 的原生 Claude Code 插件。不再�
 
 ```json
 {
-  "compactRows": [["5h", "today"], ["7d", "total"]],
-  "compactBreakpoint": 113,
+  "rows": [["ctx", "id"], ["5h", "session"], ["7d", "lines"], ["scoped"]],
+  "activity": true,
   "columns": null
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
-| `rows` | 固定宽屏布局覆盖——可用项: `5h` `7d` `today` `history` `session` `model` `total` |
-| `compactRows` | 窄屏布局覆盖。不写时使用内置紧凑布局。 |
-| `compactBreakpoint` | 从宽屏切到窄屏布局的宽度阈值。 |
+| `rows` | 布局覆盖——可用项: `ctx` `5h` `7d` `scoped` `id` `session` `lines` `spend` `today` `week` `month` `total` `history`。`scoped`（只针对某个模型的周限额进度条）和 `spend`（所有花费时段一行）应单独占一行。单元格比其他行少的行，最后一个单元格会横跨剩余的列。 |
+| `compactRows` | 窄终端使用的布局。默认与 `rows` 相同，以紧凑方式绘制。 |
+| `compactBreakpoint` | 宽度不超过该值时总是使用紧凑布局。默认由 ccbar 选择能放下的布局。 |
 | `columns` | 覆盖检测到的宽度（`null` = 自动检测；如果拿不到宽度信号，会回退到安全默认值） |
+| `activity` | 设为 `false` 隐藏正在运行的工具、子代理和 todo 这一行。 |
 
 </details>
 
@@ -148,10 +159,12 @@ ccbar 现在是基于 Node.js/TypeScript 的原生 Claude Code 插件。不再�
 ## 工作原理
 
 ```
-stdin JSON → 插件运行时 → 扫描 ~/.claude/projects/**/*.jsonl
+stdin JSON → 插件运行时 → 读取 ~/.claude/projects/**/*.jsonl 的新增内容
            → 按 message.id 去重 → 按模型定价
            → 自适应布局 → stdout
 ```
+
+每个 transcript 只完整读取一次。ccbar 把各项目的汇总保存在 `~/.cache/ccbar/`，之后每次渲染只读取上次以来新追加的字节，因此无论历史多长，一次渲染只需几十毫秒。用量限额由一个短暂的后台进程最多每分钟刷新一次，期间渲染显示最近一次的数值。
 
 插件命令：
 - `/ccbar:setup` 接管 `statusLine.command`

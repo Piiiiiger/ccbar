@@ -1,15 +1,27 @@
-import { execFile } from "node:child_process";
-import crypto from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-export const QUOTA_CACHE_TTL_MS = 30_000;
-export const QUOTA_CACHE_PATH = path.join(os.tmpdir(), "ccbar-quota.json");
+import { cacheDir, hash64, readJsonCache, writeJsonCache } from "./cache.js";
+export const QUOTA_CACHE_TTL_MS = 60_000;
+// While a background refresh runs (or keeps failing), keep showing the last
+// good quota for this long rather than blanking the bars.
+export const QUOTA_STALE_LIMIT_MS = 10 * 60_000;
+const QUOTA_MAX_BACKOFF_MS = 10 * 60_000;
+const REFRESH_LOCK_MS = 30_000;
 export const QUOTA_API_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 export const QUOTA_BETA_HEADER = "oauth-2025-04-20";
 const execFileAsync = promisify(execFile);
 const API_AUTH_METHODS = new Set(["api", "apiKey", "api-key", "accessToken"]);
+export function quotaCachePath() {
+    return path.join(cacheDir(), "quota.json");
+}
+function refreshLockPath() {
+    return path.join(cacheDir(), "quota.lock");
+}
 async function readAuthStatus() {
     try {
         const { stdout } = await execFileAsync("claude", ["auth", "status", "--json"], {
@@ -21,42 +33,54 @@ async function readAuthStatus() {
         return null;
     }
 }
-async function readKeychainOauthToken() {
+function parseOauthToken(raw) {
+    const parsed = JSON.parse(raw.trim());
+    return parsed.claudeAiOauth?.accessToken ?? "";
+}
+async function readCredentialsFileOauthToken() {
+    const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
     try {
-        const { stdout } = await execFileAsync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"]);
-        const parsed = JSON.parse(stdout.trim());
-        return parsed.claudeAiOauth?.accessToken ?? "";
+        return parseOauthToken(await readFile(path.join(configDir, ".credentials.json"), "utf8"));
     }
     catch {
         return "";
     }
 }
-async function readQuotaCache(cachePath = QUOTA_CACHE_PATH) {
+async function readOauthToken() {
+    return (await readCredentialsFileOauthToken()) || (await readKeychainOauthToken());
+}
+async function readKeychainOauthToken() {
     try {
-        const raw = await readFile(cachePath, "utf8");
-        const parsed = JSON.parse(raw);
-        if (parsed.status !== "ok" ||
-            typeof parsed.authMethod !== "string" ||
-            typeof parsed.tokenFingerprint !== "string" ||
-            typeof parsed.fetchedAt !== "number" ||
-            typeof parsed.quota !== "object" ||
-            parsed.quota == null) {
-            return null;
-        }
-        return {
-            status: parsed.status,
-            authMethod: parsed.authMethod,
-            tokenFingerprint: parsed.tokenFingerprint,
-            fetchedAt: parsed.fetchedAt,
-            quota: parsed.quota,
-        };
+        const { stdout } = await execFileAsync("security", ["find-generic-password", "-s", "Claude Code-credentials", "-w"]);
+        return parseOauthToken(stdout);
     }
     catch {
-        return null;
+        return "";
     }
 }
-async function writeQuotaCache(cache, cachePath = QUOTA_CACHE_PATH) {
-    await writeFile(`${cachePath}`, `${JSON.stringify(cache)}\n`, "utf8");
+async function readQuotaCache() {
+    const parsed = readJsonCache(quotaCachePath());
+    if (!parsed ||
+        (parsed.status !== "ok" && parsed.status !== "error") ||
+        typeof parsed.authMethod !== "string" ||
+        typeof parsed.tokenFingerprint !== "string" ||
+        typeof parsed.fetchedAt !== "number" ||
+        typeof parsed.quota !== "object" ||
+        parsed.quota == null) {
+        return null;
+    }
+    return {
+        status: parsed.status,
+        authMethod: parsed.authMethod,
+        tokenFingerprint: parsed.tokenFingerprint,
+        fetchedAt: parsed.fetchedAt,
+        quota: parsed.quota,
+        okAt: typeof parsed.okAt === "number" ? parsed.okAt : undefined,
+        failures: typeof parsed.failures === "number" ? parsed.failures : undefined,
+    };
+}
+async function writeQuotaCache(cache) {
+    writeJsonCache(quotaCachePath(), cache);
 }
 async function fetchQuotaFromApi(token) {
     const response = await fetch(QUOTA_API_ENDPOINT, {
@@ -77,7 +101,7 @@ export function tokenFingerprint(token) {
     if (!token) {
         return "";
     }
-    return crypto.createHash("sha256").update(token).digest("hex").slice(0, 16);
+    return hash64(token);
 }
 export async function resolveAuthMode(deps = {}) {
     const status = await (deps.readAuthStatus ?? readAuthStatus)();
@@ -135,33 +159,125 @@ export async function pollQuotaWithRetry({ token, fetchQuota, sleep = async () =
     }
     throw new Error("quota polling exhausted all attempts");
 }
-export async function resolveRenderableQuota(deps = {}) {
-    const authMode = await resolveAuthMode({
-        readAuthStatus: deps.readAuthStatus,
-    });
-    if (authMode !== "oauth") {
-        return null;
-    }
-    const token = await (deps.readOauthToken ?? readKeychainOauthToken)();
+// Fetches the quota in the foreground and records the outcome in the cache.
+// Failures keep the last good quota, so a refresh never blanks the bars.
+export async function refreshQuotaCache(deps = {}, maxAttempts = 2) {
+    const now = deps.now ?? (() => Date.now());
+    const token = await (deps.readOauthToken ?? readOauthToken)();
     if (!token) {
         return null;
     }
-    const now = deps.now ?? (() => Date.now());
-    const cachedQuota = selectRenderableQuota(authMode, tokenFingerprint(token), await (deps.readCache ?? readQuotaCache)(), now());
-    if (cachedQuota) {
-        return cachedQuota;
-    }
-    try {
-        const cacheEntry = await pollQuotaWithRetry({
-            token,
-            fetchQuota: async () => await (deps.fetchQuota ?? fetchQuotaFromApi)(token),
-            sleep: deps.sleep,
-            now,
+    const fingerprint = tokenFingerprint(token);
+    const writeCache = deps.writeCache ?? writeQuotaCache;
+    const authMode = await resolveAuthMode({ readAuthStatus: deps.readAuthStatus });
+    if (authMode !== "oauth") {
+        await writeCache({
+            status: "ok",
+            authMethod: authMode,
+            tokenFingerprint: fingerprint,
+            fetchedAt: now(),
+            quota: {},
         });
-        await (deps.writeCache ?? writeQuotaCache)(cacheEntry);
-        return cacheEntry.quota;
-    }
-    catch {
         return null;
     }
+    const previous = await (deps.readCache ?? readQuotaCache)();
+    const kept = previous?.tokenFingerprint === fingerprint && previous.authMethod === "claude.ai"
+        ? previous
+        : null;
+    try {
+        const entry = await pollQuotaWithRetry({
+            token,
+            fetchQuota: async () => await (deps.fetchQuota ?? fetchQuotaFromApi)(token),
+            sleep: deps.sleep ?? (async (ms) => await new Promise((resolve) => setTimeout(resolve, ms))),
+            now,
+            maxAttempts,
+        });
+        await writeCache({ ...entry, okAt: entry.fetchedAt });
+        return entry.quota;
+    }
+    catch {
+        await writeCache({
+            status: "error",
+            authMethod: "claude.ai",
+            tokenFingerprint: fingerprint,
+            fetchedAt: now(),
+            quota: kept?.quota ?? {},
+            okAt: kept?.okAt,
+            failures: (previous?.tokenFingerprint === fingerprint ? previous.failures ?? 0 : 0) + 1,
+        });
+        return null;
+    }
+}
+export function releaseRefreshLock() {
+    rmSync(refreshLockPath(), { force: true });
+}
+// Starts `cli.js refresh-quota` as a detached process and returns at once.
+// The lock file keeps concurrent renders from starting more than one refresh.
+function startBackgroundRefresh() {
+    const lockPath = refreshLockPath();
+    try {
+        mkdirSync(path.dirname(lockPath), { recursive: true });
+        try {
+            if (Date.now() - statSync(lockPath).mtimeMs < REFRESH_LOCK_MS) {
+                return;
+            }
+            rmSync(lockPath, { force: true });
+        }
+        catch {
+            // No lock yet.
+        }
+        writeFileSync(lockPath, String(process.pid), { flag: "wx" });
+    }
+    catch {
+        return;
+    }
+    try {
+        const cliPath = fileURLToPath(new URL("./cli.js", import.meta.url));
+        spawn(process.execPath, [cliPath, "refresh-quota"], {
+            detached: true,
+            stdio: "ignore",
+        }).unref();
+    }
+    catch {
+        releaseRefreshLock();
+    }
+}
+export function quotaRetryDelay(cache) {
+    if (cache.status !== "error") {
+        return QUOTA_CACHE_TTL_MS;
+    }
+    const failures = Math.max(1, cache.failures ?? 1);
+    return Math.min(QUOTA_MAX_BACKOFF_MS, QUOTA_CACHE_TTL_MS * 2 ** (failures - 1));
+}
+// Renders never wait on the network once a quota is cached: a stale entry is
+// shown as-is while a detached process refreshes it for the next render.
+export async function resolveQuotaSnapshot(deps = {}) {
+    const now = deps.now ?? (() => Date.now());
+    const token = await (deps.readOauthToken ?? readOauthToken)();
+    if (!token) {
+        return null;
+    }
+    const cache = await (deps.readCache ?? readQuotaCache)();
+    if (!cache || cache.tokenFingerprint !== tokenFingerprint(token)) {
+        if (deps.background) {
+            (deps.startRefresh ?? startBackgroundRefresh)();
+            return null;
+        }
+        // First render for this login: one foreground attempt, no retries.
+        const startedAt = now();
+        const quota = await refreshQuotaCache({ ...deps, readOauthToken: async () => token }, 1);
+        return quota ? { quota, okAt: startedAt } : null;
+    }
+    if (now() - cache.fetchedAt >= quotaRetryDelay(cache)) {
+        (deps.startRefresh ?? startBackgroundRefresh)();
+    }
+    if (cache.authMethod !== "claude.ai" || cache.okAt == null) {
+        return null;
+    }
+    return now() - cache.okAt <= QUOTA_STALE_LIMIT_MS && Object.keys(cache.quota).length > 0
+        ? { quota: cache.quota, okAt: cache.okAt }
+        : null;
+}
+export async function resolveRenderableQuota(deps = {}) {
+    return (await resolveQuotaSnapshot(deps))?.quota ?? null;
 }

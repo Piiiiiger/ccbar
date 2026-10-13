@@ -1,21 +1,26 @@
 import {
   DEFAULT_AUTO_COLUMNS,
-  DEFAULT_COMPACT_BREAKPOINT,
-  DEFAULT_COMPACT_LAYOUT,
   DEFAULT_LAYOUT,
+  LEGACY_LAYOUTS,
   type PluginConfig,
 } from "./config.js";
+import type { SessionActivity } from "./activity.js";
+import type { GitStatus } from "./git.js";
 import type { TokenStats } from "./transcript.js";
 
 type StatuslineInput = {
   model?: string | { display_name?: string };
+  rate_limits?: unknown;
+  // Only present while the model supports reasoning effort.
+  effort?: { level?: string } | null;
+  thinking?: { enabled?: boolean } | null;
   workspace?: {
     current_dir?: string;
     project_dir?: string;
   };
   cwd?: string;
   context_window?: {
-    used_percentage?: number;
+    used_percentage?: number | null;
   };
   cost?: {
     total_cost_usd?: number;
@@ -31,140 +36,84 @@ type RenderState = {
   columns?: number;
   now?: Date;
   config?: PluginConfig;
+  git?: GitStatus | null;
+  activity?: SessionActivity | null;
 };
 
-type Cell = {
-  left: string;
-  right?: string;
+type StatsBucket = Omit<TokenStats, "projects" | "recent" | "recentByFamily">;
+
+type Period = "today" | "week" | "month" | "all";
+
+type RenderContext = {
+  input: StatuslineInput;
+  state: RenderState;
+  projectStats: StatsBucket | null;
+  now: Date;
+  compact: boolean;
+  maxColumns: number;
 };
 
-type StatsBucket = Omit<TokenStats, "projects">;
+type Rgb = readonly [number, number, number];
 
 const ANSI_RE = /\u001b\[[0-9;]*m/g;
 const RESET = "\u001b[0m";
+const COLUMN_GAP = "   ";
+const BAR_LABEL_WIDTH = 8;
 
+// Muted labels, brighter values; hues stay apart for red-green colour blindness.
 const COLORS = {
-  sep: [60, 60, 70],
-  label: [70, 110, 180],
-  sess: [80, 105, 170],
-  today: [65, 120, 175],
-  week: [75, 115, 165],
-  month: [85, 100, 160],
-  ctx: [60, 125, 185],
-  cost: [255, 210, 60],
-  burn: [255, 190, 50],
-  proj_: [240, 180, 50],
-  tleft: [170, 150, 230],
-  dur: [180, 155, 220],
-  time: [240, 170, 110],
-  tok: [200, 210, 230],
-  model: [80, 220, 170],
-  proj: [255, 140, 80],
-  hit: [200, 170, 100],
-  cache: [170, 145, 110],
-  dim: [120, 120, 140],
-  empty: [45, 45, 45],
-  total: [110, 155, 200],
-  "lines+": [80, 210, 100],
-  "lines-": [220, 90, 90],
-} as const;
+  label: [128, 136, 152],
+  dim: [100, 106, 120],
+  track: [58, 62, 72],
+  value: [214, 219, 228],
+  cost: [232, 196, 104],
+  model: [120, 196, 214],
+  project: [226, 152, 98],
+  branch: [168, 146, 222],
+  warn: [232, 168, 64],
+  tool: [150, 182, 214],
+  agent: [190, 150, 220],
+  added: [120, 184, 232],
+  removed: [232, 128, 104],
+} as const satisfies Record<string, Rgb>;
 
 type ColorName = keyof typeof COLORS;
 
-function rgb(r: number, g: number, b: number): string {
-  return `\u001b[1;38;2;${r};${g};${b}m`;
+// Usage scale: blue (plenty left) → amber → vermillion (nearly used up).
+const USAGE_STOPS: [number, Rgb][] = [
+  [0, [86, 156, 214]],
+  [0.6, [224, 190, 90]],
+  [1, [230, 104, 74]],
+];
+
+function sgr([r, g, b]: Rgb, bold = false): string {
+  return `\u001b[${bold ? "1;" : ""}38;2;${r};${g};${b}m`;
 }
 
-function paint(name: ColorName, value: string): string {
-  const [r, g, b] = COLORS[name];
-  return `${rgb(r, g, b)}${value}${RESET}`;
+function paint(name: ColorName, value: string, bold = false): string {
+  return `${sgr(COLORS[name], bold)}${value}${RESET}`;
 }
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function hslRgb(h: number, s = 0.8, l = 0.52): [number, number, number] {
-  const hue = clamp(h, 0, 120);
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs((hue / 60) % 2 - 1));
-  const m = l - c / 2;
-
-  let r = 0;
-  let g = 0;
-  let b = 0;
-  if (hue < 60) {
-    r = c;
-    g = x;
-  } else {
-    r = x;
-    g = c;
+function usageRgb(fraction: number): Rgb {
+  const t = clamp(fraction, 0, 1);
+  for (let index = 1; index < USAGE_STOPS.length; index += 1) {
+    const [end, to] = USAGE_STOPS[index];
+    const [start, from] = USAGE_STOPS[index - 1];
+    if (t <= end) {
+      const f = (t - start) / (end - start);
+      return [0, 1, 2].map((channel) =>
+        Math.round(from[channel] + (to[channel] - from[channel]) * f),
+      ) as unknown as Rgb;
+    }
   }
-
-  return [
-    Math.round((r + m) * 255),
-    Math.round((g + m) * 255),
-    Math.round((b + m) * 255),
-  ];
+  return USAGE_STOPS[USAGE_STOPS.length - 1][1];
 }
 
-function gradientColor(pct: number): string {
-  const ratio = clamp(pct, 0, 100) / 100;
-  const hue = 120 * (1 - ratio * ratio);
-  const [r, g, b] = hslRgb(hue);
-  return rgb(r, g, b);
-}
-
-function contextColor(pct: number): string {
-  const ratio = clamp(pct, 0, 100) / 100;
-  let r: number;
-  let g: number;
-  let b: number;
-
-  if (ratio < 0.5) {
-    const f = ratio / 0.5;
-    r = 140 + 95 * f;
-    g = 150 - 10 * f;
-    b = 170 - 100 * f;
-  } else {
-    const f = (ratio - 0.5) / 0.5;
-    r = 235 + 20 * f;
-    g = 140 - 80 * f;
-    b = 70 - 40 * f;
-  }
-
-  return rgb(Math.round(r), Math.round(g), Math.round(b));
-}
-
-function filledSlots(pct: number, width: number): number {
-  const clamped = clamp(pct, 0, 100);
-  const filled = Math.floor((clamped * width) / 100);
-  return clamped > 0 && filled === 0 ? 1 : filled;
-}
-
-function dualGradientBar(overallPct: number, scopedPct: number, width = 10): string {
-  const overall = filledSlots(overallPct, width);
-  const scoped = filledSlots(scopedPct, width);
-  const filled = Math.max(overall, scoped);
-
-  let bar = "";
-  for (let index = 0; index < filled; index += 1) {
-    const hue = 120 * (1 - (index + 0.5) / width);
-    const [r, g, b] = hslRgb(hue);
-    const glyph = index < overall && index < scoped ? "━" : "─";
-    bar += `${rgb(r, g, b)}${glyph}`;
-  }
-
-  if (filled < width) {
-    bar += `${paint("empty", "─".repeat(width - filled))}`;
-  } else {
-    bar += RESET;
-  }
-
-  return `${bar}${RESET}`;
-}
-
-function gradientBar(pct: number, width = 10): string {
+function usageBar(pct: number, width: number): string {
   const clamped = clamp(pct, 0, 100);
   let filled = Math.floor((clamped * width) / 100);
   if (clamped > 0 && filled === 0) {
@@ -173,43 +122,14 @@ function gradientBar(pct: number, width = 10): string {
 
   let bar = "";
   for (let index = 0; index < filled; index += 1) {
-    const hue = 120 * (1 - (index + 0.5) / width);
-    const [r, g, b] = hslRgb(hue);
-    bar += `${rgb(r, g, b)}━`;
+    bar += `${sgr(usageRgb((index + 0.5) / width))}━`;
   }
-
-  if (filled < width) {
-    bar += `${paint("empty", "─".repeat(width - filled))}`;
-  } else {
-    bar += RESET;
-  }
-
-  return `${bar}${RESET}`;
+  return `${bar}${sgr(COLORS.track)}${"─".repeat(width - filled)}${RESET}`;
 }
 
-function formatTimeLeft(value: unknown, now: Date, compact = false): string {
-  if (typeof value !== "string" || !value) {
-    return "";
-  }
-
-  const resetAt = new Date(value);
-  if (Number.isNaN(resetAt.getTime())) {
-    return "";
-  }
-
-  const seconds = Math.floor((resetAt.getTime() - now.getTime()) / 1000);
-  if (seconds <= 0) {
-    return paint("tleft", "resetting");
-  }
-
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  if (hours > 24) {
-    return paint("tleft", `${Math.floor(hours / 24)}d${hours % 24}h`);
-  }
-
-  const suffix = minutes.toString().padStart(2, "0");
-  return paint("tleft", compact ? `${hours}h${suffix}` : `${hours}h${suffix}m`);
+function usagePercent(pct: number, pad = true): string {
+  const text = `${Math.trunc(pct)}%`;
+  return `${sgr(usageRgb(pct / 100), true)}${pad ? text.padEnd(4) : text}${RESET}`;
 }
 
 function visibleLength(value: string): number {
@@ -220,13 +140,6 @@ function padVisible(value: string, width: number): string {
   return value + " ".repeat(Math.max(0, width - visibleLength(value)));
 }
 
-function formatTokens(value: number): string {
-  if (value >= 1_000_000_000) return `${(value / 1e9).toFixed(1)}B`;
-  if (value >= 1_000_000) return `${(value / 1e6).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1e3).toFixed(1)}k`;
-  return `${Math.trunc(value)}`;
-}
-
 function formatCost(value: number): string {
   if (value >= 1_000_000) return `$${(value / 1e6).toFixed(1)}M`;
   if (value >= 1_000) return `$${(value / 1e3).toFixed(1)}k`;
@@ -235,64 +148,20 @@ function formatCost(value: number): string {
   return `$${value.toFixed(2)}`;
 }
 
-function formatDuration(durationMs: number): string {
-  if (durationMs <= 0) {
-    return "";
-  }
+// "38 min", "4h 26m", "5d 6h": the unit is always spelled out next to the number.
+function formatSpan(milliseconds: number): string {
+  const minutes = Math.floor(milliseconds / 60_000);
+  if (minutes < 1) return "<1 min";
+  if (minutes < 60) return `${minutes} min`;
 
-  const totalSeconds = Math.floor(durationMs / 1000);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  if (totalMinutes < 60) return `${totalMinutes}m`;
-
-  const totalHours = Math.floor(totalMinutes / 60);
-  if (totalHours >= 24) {
-    return `${Math.floor(totalHours / 24)}d${totalHours % 24}h`;
-  }
-
-  return `${totalHours}h${totalMinutes % 60}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
 }
 
-function formatTokenCache(
-  tokens: number,
-  cacheReadTokens: number,
-  inputTokens: number,
-  includeHitRate: boolean,
-): string {
-  let value = paint("tok", formatTokens(tokens));
-  if (cacheReadTokens <= 0) {
-    return value;
-  }
-
-  value += ` ${paint("cache", "♻")}${paint("hit", formatTokens(cacheReadTokens))}`;
-  if (includeHitRate && inputTokens > 0) {
-    const totalInput = cacheReadTokens + inputTokens;
-    const hitRate = totalInput > 0 ? Math.trunc((cacheReadTokens * 100) / totalInput) : 0;
-    value += `${paint("cache", `/${hitRate}%`)}`;
-  }
-
-  return value;
-}
-
-function shortenPath(input: string, maxLength = 25): string {
-  if (!input || input.length <= maxLength) {
-    return input;
-  }
-
-  const parts = input.split("/").filter(Boolean);
-  const basename = parts.at(-1) ?? "";
-  const lastTwo = parts.slice(-2).join("/");
-
-  if (lastTwo && lastTwo.length + 2 <= maxLength) {
-    return `…/${lastTwo}`;
-  }
-
-  if (basename && basename.length + 2 <= maxLength) {
-    return `…/${basename}`;
-  }
-
-  return `${input.slice(0, maxLength - 1)}…`;
+function shorten(value: string, max: number): string {
+  const singleLine = value.replace(/\s+/g, " ").trim();
+  return singleLine.length > max ? `${singleLine.slice(0, max - 1)}…` : singleLine;
 }
 
 function getModelName(input: StatuslineInput): string {
@@ -300,7 +169,7 @@ function getModelName(input: StatuslineInput): string {
     return input.model;
   }
 
-  return input.model?.display_name ?? "?";
+  return input.model?.display_name ?? "Claude";
 }
 
 function getProjectStats(tokens: TokenStats, projectDir: string): StatsBucket | null {
@@ -315,8 +184,330 @@ function getProjectStats(tokens: TokenStats, projectDir: string): StatsBucket | 
   return null;
 }
 
-function hasConfiguredRows(rows: PluginConfig["rows"] | PluginConfig["compactRows"]): rows is string[][] {
-  return Array.isArray(rows) && rows.length > 0;
+function formatCount(value: number): string {
+  if (value >= 100_000) return `${Math.round(value / 1000)}k`;
+  if (value >= 10_000) return `${(value / 1000).toFixed(1)}k`;
+  return `${Math.trunc(value)}`;
+}
+
+function periodCost(stats: StatsBucket, period: Period): number {
+  return stats[`${period}_cost`] + stats[`${period}_ccost`];
+}
+
+function barLabel(text: string): string {
+  return paint("label", text.padEnd(BAR_LABEL_WIDTH));
+}
+
+function resetsIn(value: unknown, now: Date, compact: boolean): string {
+  if (typeof value !== "string" || !value) {
+    return "";
+  }
+
+  const resetAt = Date.parse(value);
+  if (Number.isNaN(resetAt)) {
+    return "";
+  }
+
+  const remaining = resetAt - now.getTime();
+  const when = remaining <= 0 ? "now" : formatSpan(remaining);
+  return ` ${paint("dim", compact ? "resets" : "resets in")} ${paint("value", when)}`;
+}
+
+// Every bar row has the same columns, so the figures line up down the rows:
+// "5-hour  ━━──────── 20%  $40.8  resets in 3h 6m"
+const SPEND_WIDTH = 6;
+
+function barHead(label: string, pct: number | null, compact: boolean, pad = true): string {
+  const width = compact ? 6 : 10;
+  return pct == null
+    ? `${barLabel(label)}${usageBar(0, width)} ${paint("dim", pad ? "n/a".padEnd(4) : "n/a")}`
+    : `${barLabel(label)}${usageBar(pct, width)} ${usagePercent(pct, pad)}`;
+}
+
+function spendColumn(cost: number): string {
+  return paint("cost", formatCost(cost).padEnd(SPEND_WIDTH));
+}
+
+// The context bar's row has no window of its own, so it carries the
+// spending that has none either: this month and all time.
+function renderContext({ input, state, compact, maxColumns }: RenderContext): string {
+  const pct = input.context_window?.used_percentage;
+  const known = typeof pct === "number" ? pct : null;
+  const head = barHead("Context", known, compact);
+  const totals =
+    `${paint("label", "month")} ${paint("cost", formatCost(periodCost(state.tokens, "month")))}` +
+    paint("dim", " · ") +
+    `${paint("label", compact ? "all" : "all time")} ${paint("cost", formatCost(periodCost(state.tokens, "all")))}`;
+
+  // Too narrow for one line: the totals go on a second, indented one.
+  return visibleLength(head) + 1 + visibleLength(totals) <= maxColumns
+    ? `${head} ${totals}`
+    : `${barHead("Context", known, compact, false)}\n${" ".repeat(BAR_LABEL_WIDTH)}${totals}`;
+}
+
+
+// A reading older than this says how old it is.
+const STALE_NOTE_MS = 3 * 60_000;
+
+// A reading old enough to say so: a note follows its reset time.
+function staleNote(asOf: unknown, now: Date, compact: boolean): string {
+  const age = typeof asOf === "number" ? now.getTime() - asOf : 0;
+  if (age < STALE_NOTE_MS) {
+    return "";
+  }
+  return paint("dim", compact ? ` · ${formatSpan(age)} old` : ` · as of ${formatSpan(age)} ago`);
+}
+
+// The 5-hour and weekly rows: the limit, then what was spent in its window.
+function renderQuota(
+  context: RenderContext,
+  key: "five_hour" | "seven_day",
+  label: string,
+): string {
+  const { state, now, compact } = context;
+  const nowMs = now.getTime();
+  const window = state.quota?.[key] as Record<string, any> | undefined;
+  const lengthMs = key === "five_hour" ? FIVE_HOURS_MS : SEVEN_DAYS_MS;
+  const start = windowStart(state.quota, key, lengthMs, nowMs);
+  // Without limit data: the last 5 hours, and the calendar week.
+  const spend =
+    start != null
+      ? spendSince(state.tokens.recent, start)
+      : key === "five_hour"
+        ? spendSince(state.tokens.recent, nowMs - FIVE_HOURS_MS)
+        : periodCost(state.tokens, "week");
+
+  if (typeof window?.utilization !== "number") {
+    return `${barHead(label, null, compact)} ${spendColumn(spend)}`.trimEnd();
+  }
+
+  // Past its reset, the reading describes a window that is over.
+  const resetsAt = Date.parse(window.resets_at ?? "");
+  if (!Number.isNaN(resetsAt) && resetsAt <= nowMs) {
+    return `${barHead(label, null, compact)} ${spendColumn(spend)} ${paint("dim", "reset, updating")}`;
+  }
+
+  return (
+    `${barHead(label, window.utilization, compact)} ${spendColumn(spend)}` +
+    resetsIn(window.resets_at, now, compact) +
+    staleNote(window.as_of, now, compact)
+  );
+}
+
+// Weekly limits that count one model only (Fable): a row each, shown once
+// that model has been used in the window - the server reports usage, or this
+// machine's transcripts have spend on it since the window opened.
+function renderScoped({ state, now, compact }: RenderContext): string {
+  const limits = state.quota?.limits;
+  if (!Array.isArray(limits)) {
+    return "";
+  }
+
+  const nowMs = now.getTime();
+  const rows: string[] = [];
+  for (const limit of limits) {
+    const name = limit?.scope?.model?.display_name;
+    if (limit?.kind !== "weekly_scoped" || typeof name !== "string" || !name) {
+      continue;
+    }
+
+    const resetsAt = Date.parse(limit.resets_at ?? "");
+    const start = Number.isNaN(resetsAt)
+      ? null
+      : resetsAt <= nowMs
+        ? resetsAt
+        : resetsAt - SEVEN_DAYS_MS;
+    const spend =
+      start != null ? spendSince(state.tokens.recentByFamily?.[name.toLowerCase()], start) : 0;
+    const percent = typeof limit.percent === "number" ? limit.percent : null;
+    if (!((percent ?? 0) > 0 || spend > 0)) {
+      continue;
+    }
+
+    if (!Number.isNaN(resetsAt) && resetsAt <= nowMs) {
+      rows.push(`${barHead(name, null, compact)} ${spendColumn(spend)} ${paint("dim", "reset, updating")}`);
+      continue;
+    }
+
+    rows.push(
+      `${barHead(name, percent, compact)} ${spendColumn(spend)}` +
+        resetsIn(limit.resets_at, now, compact) +
+        staleNote(state.quota?.limits_as_of, now, compact),
+    );
+  }
+
+  return rows.join("\n");
+}
+
+// The session's effort level, which Claude Code sends as low, medium, high,
+// xhigh or max; "thinking off" when the session runs without thinking.
+function renderEffort({ input, compact }: RenderContext): string {
+  const level = input.effort?.level;
+  let text =
+    typeof level === "string" && /^[a-z]{1,8}$/.test(level)
+      ? `${paint("dim", " · ")}${paint("model", level)}${compact ? "" : paint("dim", " effort")}`
+      : "";
+  if (input.thinking?.enabled === false) {
+    text += `${paint("dim", " · ")}${paint("value", "thinking off")}`;
+  }
+  return text;
+}
+
+function renderIdentity(context: RenderContext): string {
+  const { input, state } = context;
+  // The directory Claude was started in: the same project "this project" spend uses.
+  const projectDir =
+    input.workspace?.project_dir ?? input.workspace?.current_dir ?? input.cwd ?? "";
+  const project = projectDir.split("/").filter(Boolean).at(-1) ?? "";
+  let cell = paint("model", getModelName(input), true) + renderEffort(context);
+
+  if (project) {
+    cell += `${paint("dim", " · ")}${paint("project", project)}`;
+  }
+
+  const git = state.git;
+  if (git) {
+    cell += ` ${paint("branch", `⎇ ${git.branch}`)}`;
+    if (git.dirty) cell += paint("warn", "*");
+    if (git.ahead > 0) cell += paint("dim", ` ↑${git.ahead}`);
+    if (git.behind > 0) cell += paint("dim", ` ↓${git.behind}`);
+  }
+
+  return cell;
+}
+
+function renderSession({ input }: RenderContext): string {
+  const duration = input.cost?.total_duration_ms ?? 0;
+  let cell =
+    `${paint("label", "Session")} ` +
+    `${paint("cost", formatCost(input.cost?.total_cost_usd ?? 0), true)}`;
+
+  if (duration > 0) {
+    cell += `${paint("dim", " · ")}${paint("value", formatSpan(duration))}`;
+  }
+
+  return cell;
+}
+
+function renderSpend(
+  { state, projectStats, compact }: RenderContext,
+  label: string,
+  period: Period,
+): string {
+  let cell =
+    `${paint("label", label)} ${paint("cost", formatCost(periodCost(state.tokens, period)), true)}`;
+
+  if (projectStats && !compact) {
+    cell +=
+      `${paint("dim", " · this project ")}` +
+      `${paint("cost", formatCost(periodCost(projectStats, period)))}`;
+  }
+
+  return cell;
+}
+
+function renderLines({ input }: RenderContext): string {
+  const added = input.cost?.total_lines_added ?? 0;
+  const removed = input.cost?.total_lines_removed ?? 0;
+  return (
+    `${paint("label", "Lines")} ${paint("added", `+${formatCount(added)}`, true)} ` +
+    paint("removed", `−${formatCount(removed)}`, true)
+  );
+}
+
+const FIVE_HOURS_MS = 5 * 3_600_000;
+const SEVEN_DAYS_MS = 7 * 24 * 3_600_000;
+
+// When the current usage-limit window opened, from its reset time. Once that
+// reset has passed, the next window opened no earlier than the reset itself.
+function windowStart(
+  quota: Record<string, any> | null,
+  key: "five_hour" | "seven_day",
+  lengthMs: number,
+  now: number,
+): number | null {
+  const resetsAt = Date.parse(quota?.[key]?.resets_at ?? "");
+  if (Number.isNaN(resetsAt)) {
+    return null;
+  }
+  return resetsAt <= now ? resetsAt : resetsAt - lengthMs;
+}
+
+function spendSince(recent: Record<string, number> | undefined, startMs: number): number {
+  // Limit windows open a fraction of a second before a whole minute
+  // (resets_at "…:59.712"): rounding puts the boundary between two of the
+  // per-minute buckets, where they split exactly.
+  const firstMinute = Math.round(startMs / 60_000);
+  let total = 0;
+  for (const [minute, cost] of Object.entries(recent ?? {})) {
+    if (Number(minute) >= firstMinute) total += cost;
+  }
+  return total;
+}
+
+// One row of spending from the shortest period to the longest. "5h" and
+// "week" follow the usage-limit windows next to them; without limit data
+// they fall back to the last 5 hours and the calendar week.
+function renderSpendStrip({ state, now, compact, maxColumns }: RenderContext): string {
+  const { tokens, quota } = state;
+  const fiveHourStart =
+    windowStart(quota, "five_hour", FIVE_HOURS_MS, now.getTime()) ?? now.getTime() - FIVE_HOURS_MS;
+  const weekStart = windowStart(quota, "seven_day", SEVEN_DAYS_MS, now.getTime());
+  const periods: [string, number][] = [
+    ["5h", spendSince(tokens.recent, fiveHourStart)],
+    ["week", weekStart != null ? spendSince(tokens.recent, weekStart) : periodCost(tokens, "week")],
+    ["month", periodCost(tokens, "month")],
+    [compact ? "all" : "all time", periodCost(tokens, "all")],
+  ];
+
+  const parts = periods.map(
+    ([label, cost]) => `${paint("label", label)} ${paint("cost", formatCost(cost), true)}`,
+  );
+  const separator = paint("dim", " · ");
+  const line = barLabel("Spent") + parts.join(separator);
+  if (visibleLength(line) <= maxColumns) {
+    return line;
+  }
+
+  // Too narrow for one line: month and all-time go on a second, indented one.
+  return (
+    `${barLabel("Spent")}${parts.slice(0, 2).join(separator)}\n` +
+    `${" ".repeat(BAR_LABEL_WIDTH)}${parts.slice(2).join(separator)}`
+  );
+}
+
+function renderItem(item: string, context: RenderContext): string {
+  switch (item) {
+    case "ctx":
+      return renderContext(context);
+    case "5h":
+      return renderQuota(context, "five_hour", "5-hour");
+    case "7d":
+      return renderQuota(context, "seven_day", "Weekly");
+    case "id":
+    case "model":
+      return renderIdentity(context);
+    case "session":
+      return renderSession(context);
+    case "lines":
+      return renderLines(context);
+    case "scoped":
+      return renderScoped(context);
+    case "spend":
+      return renderSpendStrip(context);
+    case "today":
+      return renderSpend(context, "Today", "today");
+    case "week":
+      return renderSpend(context, "Week", "week");
+    case "month":
+      return renderSpend(context, "Month", "month");
+    case "total":
+      return renderSpend(context, "Total", "all");
+    case "history":
+      return `${renderSpend(context, "Week", "week")}${COLUMN_GAP}${renderSpend(context, "Month", "month")}`;
+    default:
+      return paint("dim", item);
+  }
 }
 
 function rowsEqual(left: string[][], right: string[][]): boolean {
@@ -329,376 +520,163 @@ function rowsEqual(left: string[][], right: string[][]): boolean {
   );
 }
 
-function resolveLayout(
-  config: PluginConfig | undefined,
-  maxColumns: number,
-): { rows: string[][]; compact: boolean } {
-  const configuredRows = hasConfiguredRows(config?.rows) ? config.rows : null;
-  const configuredCompactRows = hasConfiguredRows(config?.compactRows)
-    ? config.compactRows
-    : null;
-  const hasCustomWideRows =
-    configuredRows != null && !rowsEqual(configuredRows, DEFAULT_LAYOUT);
-  const wideRows: string[][] = hasCustomWideRows ? configuredRows : DEFAULT_LAYOUT;
-
-  if (hasCustomWideRows && configuredCompactRows == null) {
-    return {
-      rows: wideRows,
-      compact: false,
-    };
-  }
-
-  const compactRows: string[][] = configuredCompactRows ?? DEFAULT_COMPACT_LAYOUT;
-  const compactBreakpoint = Math.max(
-    1,
-    config?.compactBreakpoint ?? DEFAULT_COMPACT_BREAKPOINT,
-  );
-
-  const compact = maxColumns <= compactBreakpoint;
-  return {
-    rows: compact ? compactRows : wideRows,
-    compact,
-  };
-}
-
-function render5h(quota: Record<string, any> | null, now: Date, compact = false): Cell {
-  const fiveHour = quota?.five_hour as Record<string, any> | undefined;
-  const utilization =
-    typeof fiveHour?.utilization === "number" ? Math.trunc(fiveHour.utilization) : null;
-
-  if (utilization == null) {
-    return {
-      left: `${paint("label", "5h")} ${paint("dim", "--")}`,
-    };
-  }
-
-  const resetAt = typeof fiveHour?.resets_at === "string" ? fiveHour.resets_at : null;
-
-  return {
-    left:
-      `${paint("label", "5h")} ${gradientBar(utilization, compact ? 7 : 10)} ` +
-      `${gradientColor(utilization)}${utilization}%${RESET}`,
-    right: formatTimeLeft(resetAt, now, compact),
-  };
-}
-
-type ScopedWeekly = {
-  percent: number;
-  label: string;
-};
-
-function findScopedWeekly(quota: Record<string, any> | null): ScopedWeekly | null {
-  const limits = quota?.limits;
-  if (!Array.isArray(limits)) {
+function configuredRows(rows: string[][] | null | undefined): string[][] | null {
+  if (!Array.isArray(rows) || rows.length === 0) {
     return null;
   }
 
-  let best: ScopedWeekly | null = null;
-  for (const limit of limits) {
-    if (limit?.kind !== "weekly_scoped" || typeof limit?.percent !== "number") {
+  // Layouts that earlier versions wrote as their defaults mean "use the default".
+  return LEGACY_LAYOUTS.some((legacy) => rowsEqual(rows, legacy)) ? null : rows;
+}
+
+function layoutGrid(cells: string[][], columnCount: number): { lines: string[]; width: number } {
+  const rows = cells.map((row) => row.slice(0, columnCount));
+  // The last cell of a row with fewer cells runs on across the remaining
+  // columns (the spending strip), so it does not widen the column it starts in.
+  const widths = Array.from({ length: columnCount }, (_, column) =>
+    Math.max(
+      0,
+      ...rows.map((row) => {
+        const spans = row.length < columnCount && column === row.length - 1;
+        return row[column] && !spans ? visibleLength(row[column]) : 0;
+      }),
+    ),
+  );
+  const lines = rows.map((row) =>
+    row
+      .map((cell, column) => (column === row.length - 1 ? cell : padVisible(cell, widths[column])))
+      .join(COLUMN_GAP)
+      .trimEnd(),
+  );
+  const physical = lines.flatMap((line) => line.split("\n"));
+  return { lines, width: Math.max(0, ...physical.map((line) => visibleLength(line))) };
+}
+
+function renderGrid(input: StatuslineInput, state: RenderState, maxColumns: number): string {
+  const now = state.now ?? new Date();
+  const projectDir =
+    input.workspace?.project_dir ?? input.workspace?.current_dir ?? input.cwd ?? "";
+  const projectStats = getProjectStats(state.tokens, projectDir);
+  const config = state.config;
+  const wideRows = configuredRows(config?.rows) ?? DEFAULT_LAYOUT;
+  const compactRows = configuredRows(config?.compactRows) ?? wideRows;
+  const forceCompact =
+    config?.compactBreakpoint != null && maxColumns <= config.compactBreakpoint;
+
+  // A row whose cells all render empty (no Fable use yet) takes no line.
+  const render = (rows: string[][], compact: boolean) =>
+    rows
+      .map((row) =>
+        row.map((item) => renderItem(item, { input, state, projectStats, now, compact, maxColumns })),
+      )
+      .filter((row) => row.some((cell) => visibleLength(cell) > 0));
+
+  // Full layout if it fits, then the compact one, then drop trailing columns.
+  // Cells themselves are never cut.
+  if (!forceCompact) {
+    const wide = render(wideRows, false);
+    const columns = Math.max(1, ...wide.map((row) => row.length));
+    const grid = layoutGrid(wide, columns);
+    if (grid.width <= maxColumns) {
+      return grid.lines.join("\n");
+    }
+  }
+
+  const compact = render(compactRows, true);
+  for (let columns = Math.max(1, ...compact.map((row) => row.length)); columns >= 1; columns -= 1) {
+    const grid = layoutGrid(compact, columns);
+    if (grid.width <= maxColumns || columns === 1) {
+      return grid.lines.join("\n");
+    }
+  }
+
+  return "";
+}
+
+function truncateVisible(value: string, width: number): string {
+  if (visibleLength(value) <= width) {
+    return value;
+  }
+
+  let out = "";
+  let visible = 0;
+  for (const part of value.split(/(\u001b\[[0-9;]*m)/)) {
+    if (part.startsWith("\u001b[")) {
+      out += part;
       continue;
     }
-
-    if (best && limit.percent <= best.percent) {
-      continue;
-    }
-
-    const modelName = limit?.scope?.model?.display_name;
-    best = {
-      percent: Math.trunc(limit.percent),
-      label: typeof modelName === "string" && modelName ? modelName[0].toUpperCase() : "S",
-    };
-  }
-
-  return best;
-}
-
-function render7d(quota: Record<string, any> | null, now: Date, compact = false): Cell {
-  const sevenDay = quota?.seven_day as Record<string, any> | undefined;
-  const utilization =
-    typeof sevenDay?.utilization === "number" ? Math.trunc(sevenDay.utilization) : null;
-
-  if (utilization == null) {
-    return {
-      left: `${paint("label", "7d")} ${paint("dim", "--")}`,
-    };
-  }
-
-  const resetAt = typeof sevenDay?.resets_at === "string" ? sevenDay.resets_at : null;
-  const width = compact ? 7 : 10;
-  const scoped = findScopedWeekly(quota);
-
-  if (!scoped) {
-    return {
-      left:
-        `${paint("label", "7d")} ${gradientBar(utilization, width)} ` +
-        `${gradientColor(utilization)}${utilization}%${RESET}`,
-      right: formatTimeLeft(resetAt, now, compact),
-    };
-  }
-
-  const scopedText = compact
-    ? `${scoped.percent}%`
-    : `${scoped.label}${scoped.percent}%`;
-
-  return {
-    left:
-      `${paint("label", "7d")} ${dualGradientBar(utilization, scoped.percent, width)} ` +
-      `${gradientColor(utilization)}${utilization}%${RESET}${paint("dim", "·")}` +
-      `${gradientColor(scoped.percent)}${scopedText}${RESET}`,
-    right: formatTimeLeft(resetAt, now, compact),
-  };
-}
-
-function renderToday(
-  globalStats: StatsBucket,
-  projectStats: StatsBucket | null,
-  compact = false,
-): Cell {
-  const left =
-    `${paint("today", "today")} ${paint("tok", formatTokens(globalStats.today_tok))}`;
-
-  if (!projectStats) {
-    return {
-      left,
-      right: paint("cost", formatCost(globalStats.today_cost + globalStats.today_ccost)),
-    };
-  }
-
-  return {
-    left:
-      `${left} ${paint("cost", formatCost(globalStats.today_cost + globalStats.today_ccost))}` +
-      ` ${paint("dim", "›")} ${compact ? "" : `${paint("proj", "proj")} `}` +
-      `${formatTokenCache(
-        projectStats.today_tok,
-        projectStats.today_cr_tok,
-        projectStats.today_in_tok,
-        true,
-      )}`,
-    right: paint("cost", formatCost(projectStats.today_cost + projectStats.today_ccost)),
-  };
-}
-
-function renderHistory(globalStats: StatsBucket, projectStats: StatsBucket | null): Cell {
-  let left =
-    `${paint("week", "week")} ` +
-    `${paint("cost", formatCost(globalStats.week_cost + globalStats.week_ccost))}`;
-
-  if (projectStats) {
-    left +=
-      ` ${paint("dim", "›")} ${paint("proj", "proj")} ` +
-      `${paint("tok", formatTokens(projectStats.week_tok))} ` +
-      `${paint("cost", formatCost(projectStats.week_cost + projectStats.week_ccost))}`;
-  }
-
-  left +=
-    ` ${paint("sep", "│")} ${paint("month", "month")} ` +
-    `${paint("tok", formatTokens(globalStats.month_tok))} ` +
-    `${paint("cost", formatCost(globalStats.month_cost + globalStats.month_ccost))}`;
-
-  if (projectStats) {
-    left +=
-      ` ${paint("dim", "›")} ${paint("proj", "proj")} ` +
-      `${paint("cost", formatCost(projectStats.month_cost + projectStats.month_ccost))}`;
-  }
-
-  return { left };
-}
-
-function renderSession(input: StatuslineInput, quota: Record<string, any> | null, now: Date): Cell {
-  const sessionCost = input.cost?.total_cost_usd ?? 0;
-  const totalDurationMs = input.cost?.total_duration_ms ?? 0;
-  const hours = totalDurationMs > 0 ? totalDurationMs / 3_600_000 : 0;
-  const burnRate = hours > 0.01 ? sessionCost / hours : 0;
-  const duration = formatDuration(totalDurationMs);
-  const ctx = input.context_window?.used_percentage ?? 0;
-  let left = `${paint("sess", "sess")} ${paint("cost", formatCost(sessionCost))}`;
-
-  if (burnRate > 0) {
-    left += ` ${paint("burn", `${formatCost(burnRate)}/h`)}`;
-  }
-
-  const resetAt = quota?.five_hour && typeof quota.five_hour === "object"
-    ? (quota.five_hour as Record<string, any>).resets_at
-    : null;
-  if (burnRate > 0 && typeof resetAt === "string" && resetAt) {
-    const remainingHours = Math.max(0, (new Date(resetAt).getTime() - now.getTime()) / 3_600_000);
-    if (!Number.isNaN(remainingHours) && remainingHours > 0) {
-      const projected = sessionCost + burnRate * remainingHours;
-      left += ` ${paint("proj_", `→${formatCost(projected)}`)}`;
+    for (const char of part) {
+      if (visible >= width - 1) {
+        return `${out}${RESET}${paint("dim", "…")}`;
+      }
+      out += char;
+      visible += 1;
     }
   }
 
-  if (duration) {
-    left += ` ${paint("dur", duration)}`;
-  }
-
-  if (ctx > 0) {
-    left += ` ${contextColor(ctx)}${Math.trunc(ctx)}%${RESET}`;
-  }
-
-  return {
-    left,
-    right:
-      `${paint("lines+", `+${input.cost?.total_lines_added ?? 0}`)}` +
-      `${paint("dim", "/")}` +
-      `${paint("lines-", `-${input.cost?.total_lines_removed ?? 0}`)}`,
-  };
+  return out;
 }
 
-function renderTotal(
-  globalStats: StatsBucket,
-  projectStats: StatsBucket | null,
-  cwd: string,
-  compact = false,
-): Cell {
-  let left = `${paint("total", "total")} ${paint("cost", formatCost(globalStats.all_cost + globalStats.all_ccost))}`;
+const BACKGROUND_TASK_MAX_MS = 2 * 3_600_000;
 
-  if (projectStats) {
-    left +=
-      ` ${paint("dim", "›")} ${compact ? "" : `${paint("proj", "proj")} `}` +
-      `${formatTokenCache(
-        projectStats.all_tok,
-        projectStats.all_cr_tok,
-        projectStats.all_in_tok,
-        false,
-      )} ` +
-      `${paint("cost", formatCost(projectStats.all_cost + projectStats.all_ccost))}`;
-  }
-
-  return {
-    left,
-    right: paint("dim", shortenPath(cwd, compact ? 12 : 25)),
-  };
-}
-
-function renderModel(input: StatuslineInput, now: Date): Cell {
-  const ctx = Math.trunc(input.context_window?.used_percentage ?? 0);
-  return {
-    left:
-      `${paint("ctx", "ctx")} ${contextColor(ctx)}${ctx}%${RESET} ` +
-      `${paint("model", getModelName(input))}`,
-    right: paint("time", now.toTimeString().slice(0, 5)),
-  };
-}
-
-function renderItem(
-  item: string,
-  input: StatuslineInput,
-  tokens: TokenStats,
-  projectStats: StatsBucket | null,
-  quota: Record<string, any> | null,
+// One line of what is happening right now: running tools, running subagents
+// or background tasks, and the todo in progress. Empty when nothing is.
+export function renderActivity(
+  activity: SessionActivity | null | undefined,
   now: Date,
-  compact: boolean,
-): Cell {
-  switch (item) {
-    case "5h":
-      return render5h(quota, now, compact);
-    case "7d":
-      return render7d(quota, now, compact);
-    case "today":
-      return renderToday(tokens, projectStats, compact);
-    case "history":
-      return renderHistory(tokens, projectStats);
-    case "session":
-      return renderSession(input, quota, now);
-    case "total":
-      return renderTotal(
-        tokens,
-        projectStats,
-        input.workspace?.current_dir ?? input.cwd ?? "",
-        compact,
-      );
-    case "model":
-      return renderModel(input, now);
-    default:
-      return { left: item };
+  maxColumns: number,
+): string {
+  if (!activity) {
+    return "";
   }
-}
 
-function inlineCell(cell: Cell): string {
-  return cell.right ? `${cell.left} ${cell.right}` : cell.left;
+  const groups: string[] = [];
+  const nowMs = now.getTime();
+
+  for (const tool of activity.tools.slice(-2)) {
+    const name = tool.name.startsWith("mcp__") ? (tool.name.split("__").at(-1) ?? tool.name) : tool.name;
+    groups.push(
+      `${paint("warn", "◐")} ${paint("tool", name)}` +
+        (tool.target ? `  ${paint("dim", shorten(tool.target, 40))}` : ""),
+    );
+  }
+
+  const agents = activity.agents
+    .filter((agent) =>
+      !agent.background ||
+      agent.startTime == null ||
+      nowMs - agent.startTime <= BACKGROUND_TASK_MAX_MS)
+    .slice(-2);
+  for (const agent of agents) {
+    let group = `${paint("warn", "◐")} ${paint("agent", agent.task ? agent.type : `${agent.type} agent`)}`;
+    if (agent.description) {
+      group += `  ${paint("dim", shorten(agent.description, 36))}`;
+    }
+    if (agent.startTime != null) {
+      group += `${paint("dim", " · ")}${paint("value", formatSpan(nowMs - agent.startTime))}`;
+    }
+    groups.push(group);
+  }
+
+  const current = activity.todos.find((todo) => todo.status === "in_progress");
+  if (current) {
+    const done = activity.todos.filter((todo) => todo.status === "completed").length;
+    groups.push(
+      `${paint("warn", "▸")} ${paint("value", shorten(current.content, 48))} ` +
+        paint("dim", `(${done} of ${activity.todos.length} done)`),
+    );
+  }
+
+  return groups.length > 0 ? truncateVisible(groups.join("    "), maxColumns) : "";
 }
 
 export function renderStatusline(input: StatuslineInput, state: RenderState): string {
-  const tokens = state.tokens;
-  const quota = state.quota;
-  const now = state.now ?? new Date();
-  const projectDir = input.workspace?.project_dir ?? input.workspace?.current_dir ?? input.cwd ?? "";
-  const projectStats = getProjectStats(tokens, projectDir);
-  const separator = ` ${paint("sep", "│")} `;
   const maxColumns = Math.max(1, state.columns ?? state.config?.columns ?? DEFAULT_AUTO_COLUMNS);
-  const layout = resolveLayout(state.config, maxColumns);
-  const rows = layout.rows;
-
-  const renderedRows = rows.map((row) =>
-    row.map((item) => renderItem(item, input, tokens, projectStats, quota, now, layout.compact)),
-  );
-
-  let activeColumnCount = Math.max(...renderedRows.map((row) => row.length), 1);
-
-  while (activeColumnCount > 1) {
-    const trimmedRows = renderedRows.map((row) => row.slice(0, activeColumnCount));
-
-    if (layout.compact) {
-      const widestRow = Math.max(
-        ...trimmedRows.map((row) =>
-          visibleLength(row.map((cell) => inlineCell(cell)).join(separator))),
-      );
-
-      if (widestRow <= maxColumns) {
-        return trimmedRows
-          .map((row) => row.map((cell) => inlineCell(cell)).join(separator).trimEnd())
-          .join("\n");
-      }
-
-      activeColumnCount -= 1;
-      continue;
-    }
-
-    const columnWidths = Array.from({ length: activeColumnCount }, (_, columnIndex) =>
-      Math.max(
-        ...trimmedRows.map((row) => {
-          const cell = row[columnIndex];
-          if (!cell) return 0;
-          const leftWidth = visibleLength(cell.left);
-          const rightWidth = cell.right ? visibleLength(cell.right) + 1 : 0;
-          return leftWidth + rightWidth;
-        }),
-      ),
-    );
-
-    const widestRow =
-      columnWidths.reduce((sum, width) => sum + width, 0) +
-      visibleLength(separator) * Math.max(0, activeColumnCount - 1);
-
-    if (widestRow <= maxColumns) {
-      return trimmedRows
-        .map((row) =>
-          row
-            .map((cell, columnIndex) => {
-              const targetWidth = columnWidths[columnIndex] ?? visibleLength(cell.left);
-              if (!cell.right) {
-                return padVisible(cell.left, targetWidth);
-              }
-
-              const gap = Math.max(
-                1,
-                targetWidth - visibleLength(cell.left) - visibleLength(cell.right),
-              );
-              return `${cell.left}${" ".repeat(gap)}${cell.right}`;
-            })
-            .join(separator)
-            .trimEnd(),
-        )
-        .join("\n");
-    }
-
-    activeColumnCount -= 1;
+  const grid = renderGrid(input, state, maxColumns);
+  if (state.config?.activity === false) {
+    return grid;
   }
 
-  return renderedRows
-    .map((row) => row[0]?.left ?? "")
-    .join("\n")
-    .trim();
+  const activity = renderActivity(state.activity, state.now ?? new Date(), maxColumns);
+  return activity ? `${grid}\n${activity}` : grid;
 }
